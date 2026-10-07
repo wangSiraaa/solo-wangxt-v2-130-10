@@ -28,7 +28,7 @@ from app.models.schema import (
     ComponentResult,
 )
 from app.services.snapshots import apply_optimistic_update, create_immutable_snapshot, ensure_single_generation
-from app.workers.tasks import build_pipeline
+from app.workers.tasks import STAGES, request_pipeline
 
 router = APIRouter(prefix="/api")
 
@@ -38,6 +38,134 @@ def _get(db: Session, model, entity_id: int):
     if obj is None:
         raise HTTPException(404, f"{model.__name__} {entity_id} not found")
     return obj
+
+
+def _iso(value) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _serialize_attempt(attempt) -> dict:
+    return {
+        "attempt_number": attempt.attempt_number,
+        "status": attempt.status,
+        "detail": attempt.detail,
+        "error_code": attempt.error_code,
+        "error_message": attempt.error_message,
+        "started_at": _iso(attempt.started_at),
+        "finished_at": _iso(attempt.finished_at),
+        "created_at": _iso(attempt.created_at),
+    }
+
+
+def _serialize_stage(stage: JobStage) -> dict:
+    attempts = list(stage.attempts)
+    latest = attempts[-1] if attempts else None
+    if latest is not None:
+        latest_payload = _serialize_attempt(latest)
+        latest_started = latest.started_at
+        latest_finished = latest.finished_at or latest.started_at
+    else:
+        latest_payload = {
+            "attempt_number": stage.attempt,
+            "status": stage.status,
+            "detail": stage.detail,
+            "error_code": None,
+            "error_message": None,
+            "started_at": _iso(stage.started_at),
+            "finished_at": _iso(stage.completed_at),
+            "created_at": None,
+        }
+        latest_started = stage.started_at
+        latest_finished = stage.completed_at or stage.started_at
+
+    failure_diagnostic = None
+    if latest is not None and latest.status != "confirmed":
+        failure_diagnostic = {
+            "detail": latest.detail,
+            "error_code": latest.error_code,
+            "error_message": latest.error_message,
+        }
+    elif latest is None and stage.status == "failed":
+        failure_diagnostic = {"detail": stage.detail, "error_code": None, "error_message": None}
+
+    return {
+        "name": stage.name,
+        "status": stage.status,
+        "attempt": stage.attempt,
+        "retry_count": max(0, (len(attempts) if attempts else stage.attempt) - 1),
+        "detail": stage.detail,
+        "started_at": _iso(stage.started_at),
+        "confirmed_at": _iso(stage.confirmed_at),
+        "completed_at": _iso(stage.completed_at),
+        "latest_attempt": latest_payload,
+        "latest_attempt_at": _iso(latest_finished or latest_started),
+        "failure_diagnostic": failure_diagnostic,
+        "attempts": [_serialize_attempt(attempt) for attempt in attempts],
+    }
+
+
+def _recovery_point(stages: dict[str, JobStage]) -> str | None:
+    for name in STAGES:
+        stage = stages.get(name)
+        if stage is not None and stage.status != "confirmed":
+            return name
+    return None
+
+
+def _publication_blockers(job: Job, stages: dict[str, JobStage]) -> list[str]:
+    blockers: list[str] = []
+    if str(job.status) == "audited_only":
+        blockers.append("旧快照任务只能审计；请基于当前草稿创建新快照后发布。")
+    elif str(job.status) != "completed":
+        recovery_stage = _recovery_point(stages)
+        if recovery_stage:
+            blockers.append(f"任务尚未通过 {recovery_stage}，当前不是可发布成果。")
+        else:
+            blockers.append(f"任务状态为 {job.status}，当前不是可发布成果。")
+
+    for name in STAGES:
+        stage = stages.get(name)
+        if stage is None:
+            continue
+        diagnostic = stage.attempts[-1] if stage.attempts else None
+        if stage.status == "failed":
+            message = diagnostic.error_message if diagnostic is not None else None
+            blockers.append(f"{name} 未通过：{message or '请查看阶段诊断'}")
+        elif name == "publish_checks" and stage.status == "confirmed":
+            for check_name, check in stage.detail.items():
+                if isinstance(check, dict) and not check.get("passed", False):
+                    blockers.append(f"发布核对 {check_name} 未通过")
+    if job.error_code:
+        blockers.append(f"{job.error_code}: {job.error_message or '需要恢复后才能发布'}")
+    return list(dict.fromkeys(blockers))
+
+
+def _serialize_job(db: Session, job: Job) -> dict:
+    stages = {stage.name: stage for stage in job.stages}
+    recovery_stage = _recovery_point(stages)
+    has_publication = bool(
+        db.scalar(select(Publication.id).where(Publication.job_id == job.id).limit(1))
+    )
+    blockers = _publication_blockers(job, stages)
+    return {
+        "id": job.id,
+        "status": job.status,
+        "current_stage": job.current_stage,
+        "generation_key": job.generation_key,
+        "snapshot_version": job.snapshot.version,
+        "input_summary": job.snapshot.input_summary,
+        "algorithm": job.snapshot.algorithm,
+        "diagnostics": job.diagnostics,
+        "error_code": job.error_code,
+        "error_message": job.error_message,
+        "recovery_stage": recovery_stage,
+        "confirmed_stages": [name for name in STAGES if (stages.get(name) and stages[name].status == "confirmed")],
+        "can_resume": str(job.status) in {"failed", "awaiting_recovery", "pending"} and recovery_stage is not None,
+        "can_publish": str(job.status) == "completed" and not blockers,
+        "publication_blockers": blockers,
+        "has_publication": has_publication,
+        "stages": [_serialize_stage(stages[name]) for name in STAGES if name in stages],
+    }
 
 
 @router.post("/projects", status_code=201)
@@ -150,7 +278,7 @@ def submit_job(project_id: int, db: Session = Depends(get_db)):
     job, created = ensure_single_generation(db, project_id, snapshot.id)
     db.commit()
     if created:
-        build_pipeline(job.id).apply_async()
+        request_pipeline(job.id)
     return {
         "job_id": job.id,
         "snapshot_id": snapshot.id,
@@ -164,11 +292,20 @@ def submit_job(project_id: int, db: Session = Depends(get_db)):
 def resume_job(job_id: int, db: Session = Depends(get_db)):
     job = _get(db, Job, job_id)
     stages = {s.name: s for s in job.stages}
-    # Confirmed stages are skipped. Failed stages are retried; /resume also resets
-    # RUNNING markers left by a killed worker.
-    pipeline = build_pipeline(job.id)
-    pipeline.apply_async()
-    return {"job_id": job.id, "current_stage": job.current_stage, "confirmed": [n for n, s in stages.items() if s.status == "confirmed"]}
+    recovery_stage = _recovery_point(stages)
+    if recovery_stage is None:
+        raise HTTPException(409, "all stages are already confirmed; resume cannot rerun this job")
+    if str(job.status) not in {"failed", "awaiting_recovery", "pending"}:
+        raise HTTPException(409, f"job {job.status} cannot be resumed")
+
+    enqueued = request_pipeline(job.id)
+    return {
+        "job_id": job.id,
+        "recovery_stage": recovery_stage,
+        "confirmed": [name for name, stage in stages.items() if stage.status == "confirmed"],
+        "enqueued": enqueued,
+        "deduplicated": not enqueued,
+    }
 
 
 @router.get("/projects/{project_id}/topology")
@@ -195,20 +332,7 @@ def topology(project_id: int, db: Session = Depends(get_db)):
 @router.get("/jobs/{job_id}")
 def job_detail(job_id: int, db: Session = Depends(get_db)):
     job = _get(db, Job, job_id)
-    return {
-        "id": job.id,
-        "status": job.status,
-        "current_stage": job.current_stage,
-        "generation_key": job.generation_key,
-        "snapshot_version": job.snapshot.version,
-        "input_summary": job.snapshot.input_summary,
-        "algorithm": job.snapshot.algorithm,
-        "diagnostics": job.diagnostics,
-        "stages": [
-            {"name": s.name, "status": s.status, "attempt": s.attempt, "detail": s.detail}
-            for s in sorted(db.scalars(select(JobStage).where(JobStage.job_id == job_id)).all(), key=lambda s: s.id)
-        ],
-    }
+    return _serialize_job(db, job)
 
 
 @router.get("/jobs/{job_id}/residuals")

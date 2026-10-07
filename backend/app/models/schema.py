@@ -175,7 +175,18 @@ class Job(Base):
     lock_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     snapshot = relationship("Snapshot")
-    stages = relationship("JobStage", back_populates="job", cascade="all, delete-orphan")
+    stages = relationship(
+        "JobStage",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="JobStage.id",
+    )
+    stage_attempts = relationship(
+        "JobStageAttempt",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="JobStageAttempt.attempt_number",
+    )
 
 
 class JobStage(Base):
@@ -193,6 +204,37 @@ class JobStage(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     job = relationship("Job", back_populates="stages")
+    attempts = relationship(
+        "JobStageAttempt",
+        back_populates="stage",
+        cascade="all, delete-orphan",
+        order_by="JobStageAttempt.attempt_number",
+    )
+
+
+class JobStageAttempt(Base):
+    """Immutable audit row for one execution attempt of a resumable stage."""
+
+    __tablename__ = "job_stage_attempts"
+    __table_args__ = (
+        UniqueConstraint("stage_id", "attempt_number", name="uq_stage_attempt_number"),
+        Index("ix_stage_attempt_job", "job_id", "stage_id", "attempt_number"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    stage_id: Mapped[int] = mapped_column(ForeignKey("job_stages.id", ondelete="CASCADE"), nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    job = relationship("Job", back_populates="stage_attempts")
+    stage = relationship("JobStage", back_populates="attempts")
 
 
 class ComponentResult(Base):

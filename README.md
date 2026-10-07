@@ -16,6 +16,7 @@
 4. **旧任务只能审计**：测量员修订观测/基准/权重后产生新草稿/快照；运行中的旧任务可完成，但发布检查会标记 `AUDITED_ONLY`，无法覆盖新草稿。
 5. **禁止随意正则化**：没有 ridge、人为固定高程或先验“补秩”。病态/秩亏显式进入 QR 诊断；无基准连通分量返回 `blocked_rank_deficient`，多基准矛盾返回 `blocked_datum_contradiction`。
 6. **中断恢复按阶段确认**：`import_qc -> component_precheck -> solve -> publish_checks`，只有 `confirmed` 阶段可跳过；失败/运行中阶段重新执行，不回滚已确认产物。
+7. **失败尝试可审计**：每次阶段尝试（含中断、失败和确认）写入不可变尝试记录；重试只新增尝试，不覆盖旧诊断。恢复面板显示最近尝试、确认时间、重试次数、恢复点和发布阻断原因，重复点击恢复由 Redis 恢复锁合并。
 
 ## 快速启动
 
@@ -102,8 +103,11 @@ curl -X PATCH http://localhost:8000/api/weight-rules/2 \
 # 生成当前草稿的不可变快照；重复提交同一快照返回 deduplicated=true
 curl -X POST http://localhost:8000/api/projects/1/jobs
 
-# Worker 中断/重启后从最后一个 confirmed 阶段之后恢复
+# Worker 中断/重启后从最后一个 confirmed 阶段之后恢复；响应中的 recovery_stage 是下一次执行点
 curl -X POST http://localhost:8000/api/jobs/1/resume
+
+# 面板可读取每阶段 latest_attempt、confirmed_at、failure_diagnostic、retry_count 和 attempts 审计记录
+curl http://localhost:8000/api/jobs/1
 
 # 仅当前快照、全部检查通过才发布
 curl -X POST http://localhost:8000/api/jobs/1/publish \
@@ -147,7 +151,7 @@ cd backend && pytest -q
 | 不连通子网 | 分量预检当天列出点/边/基准数；无基准分量 QR 诊断阻塞，不拼接、不虚构连接 |
 | 多基准矛盾 | 基准作为带权行；超过 3σ 的基准残差触发 `blocked_datum_contradiction` |
 | 求解途中修订权重 | 旧 Job 继续绑定旧快照；新草稿必须生成新快照；旧任务完成后仅 `AUDITED_ONLY` |
-| Worker 重启 | stage `confirmed_at` 作为恢复点；orchestrator 跳过已确认阶段 |
+| Worker 重启 | stage `confirmed_at` 作为恢复点；orchestrator 跳过已确认阶段；`job_stage_attempts` 保留中断和旧失败记录 |
 | 重复提交 | `uq_job_generation` 保证项目+快照只有一个 Job 代次 |
 | 发布 | 核对闭合环、基准约束、改正数/残差统计、快照哈希、算法参数和 `regularization=none` |
 

@@ -12,6 +12,7 @@ export default function App() {
   const [job, setJob] = useState<Job | null>(null);
   const [residuals, setResiduals] = useState<ResidualRow[]>([]);
   const [message, setMessage] = useState('');
+  const [resuming, setResuming] = useState(false);
 
   useEffect(() => {
     api<{ nodes: unknown[]; edges: unknown[] }>(`/api/projects/${projectId}/topology`)
@@ -20,13 +21,17 @@ export default function App() {
   }, [projectId]);
 
   useEffect(() => {
-    if (!job || ['completed', 'failed'].includes(job.status)) return;
+    if (
+      !job ||
+      (['completed', 'failed', 'audited_only'].includes(job.status) && !resuming)
+    )
+      return;
     const timer = window.setInterval(async () => {
       const next = await api<Job>(`/api/jobs/${job!.id}`);
       setJob(next);
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [job]);
+  }, [job, resuming]);
 
   const cyElements = useMemo(() => elements, [elements]);
 
@@ -43,8 +48,25 @@ export default function App() {
 
   async function resume() {
     if (!job) return;
-    await api(`/api/jobs/${job.id}/resume`, { method: 'POST' });
-    setMessage('已从最后一个已确认阶段恢复');
+    setResuming(true);
+    try {
+      const result = await api<{
+        enqueued: boolean;
+        deduplicated: boolean;
+        recovery_stage: string;
+      }>(`/api/jobs/${job.id}/resume`, { method: 'POST' });
+      setMessage(
+        result.deduplicated
+          ? '已有恢复任务在运行，未创建第二个同快照 Job。'
+          : `已从 ${result.recovery_stage} 恢复；之前确认的阶段不会重跑。`
+      );
+      const detail = await api<Job>(`/api/jobs/${job.id}`);
+      setJob(detail);
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setResuming(false);
+    }
   }
 
   async function publish() {
@@ -78,13 +100,13 @@ export default function App() {
           <input value={projectId} onChange={(event) => setProjectId(Number(event.target.value))} type="number" />
         </label>
         <button onClick={submitSnapshot}>提交当前草稿快照</button>
-        <button onClick={resume} disabled={!job}>
-          从确认阶段恢复
+        <button onClick={resume} disabled={!job?.can_resume || resuming}>
+          从确认点恢复
         </button>
         <button onClick={loadResiduals} disabled={!job}>
           查看残差
         </button>
-        <button onClick={publish} disabled={job?.status !== 'completed'} className="primary">
+        <button onClick={publish} disabled={!job?.can_publish} className="primary">
           发布成果
         </button>
       </section>
@@ -100,7 +122,7 @@ export default function App() {
           <h2>任务阶段</h2>
           {job ? (
             <>
-              <StageTracker stages={job.stages} />
+              <StageTracker job={job} onResume={resume} resuming={resuming} />
               <dl className="facts">
                 <dt>状态</dt>
                 <dd>{job.status}</dd>
