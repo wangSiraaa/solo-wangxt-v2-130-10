@@ -195,6 +195,41 @@ class JobStage(Base):
     job = relationship("Job", back_populates="stages")
 
 
+class StageAttemptStatus(StrEnum):
+    CONFIRMED = "confirmed"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class JobStageAttempt(Base):
+    """Immutable audit record of one stage attempt.
+
+    A retry never overwrites history: every terminal transition of a stage
+    (confirmed/failed) or an interrupted RUNNING marker appends a new row keyed
+    by (job_id, stage_name, attempt), so质检员 can audit every attempt after a
+    worker restart.
+    """
+
+    __tablename__ = "job_stage_attempts"
+    __table_args__ = (
+        UniqueConstraint("job_id", "stage_name", "attempt", name="uq_stage_attempt"),
+        Index("ix_stage_attempt_job_stage", "job_id", "stage_name"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
+    stage_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(120))
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    job = relationship("Job")
+
+
 class ComponentResult(Base):
     __tablename__ = "component_results"
     __table_args__ = (Index("ix_component_job", "job_id", "component_index", unique=True),)

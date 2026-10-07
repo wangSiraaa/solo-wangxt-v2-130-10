@@ -18,6 +18,7 @@ from app.models.schema import (
     Datum,
     Job,
     JobStage,
+    JobStageAttempt,
     Observation,
     Point,
     Project,
@@ -28,6 +29,7 @@ from app.models.schema import (
     ComponentResult,
 )
 from app.services.snapshots import apply_optimistic_update, create_immutable_snapshot, ensure_single_generation
+from app.services.stages import STAGE_ORDER, recovery_point, retry_stages, serialize_attempt, serialize_stage
 from app.workers.tasks import build_pipeline
 
 router = APIRouter(prefix="/api")
@@ -66,7 +68,7 @@ def bulk_import(project_id: int, payload: BulkImportIn, db: Session = Depends(ge
     db.flush()
     points = {p.code: p for p in db.scalars(select(Point).where(Point.project_id == project_id)).all()}
     missing = sorted(
-        {obs.from_code for obs in payload.observations} | {obs.to_code for obs in payload.observations} - set(points)
+        ({obs.from_code for obs in payload.observations} | {obs.to_code for obs in payload.observations}) - set(points)
     )
     if missing:
         raise HTTPException(400, f"unknown point codes in observations: {missing[:20]}")
@@ -163,12 +165,32 @@ def submit_job(project_id: int, db: Session = Depends(get_db)):
 @router.post("/jobs/{job_id}/resume", status_code=202)
 def resume_job(job_id: int, db: Session = Depends(get_db)):
     job = _get(db, Job, job_id)
-    stages = {s.name: s for s in job.stages}
-    # Confirmed stages are skipped. Failed stages are retried; /resume also resets
-    # RUNNING markers left by a killed worker.
+    stage_map = {s.name: s for s in job.stages}
+    # Confirmed stages are never re-run; resume continues at the first
+    # non-confirmed stage and retries everything from there on.
+    confirmed = [name for name in STAGE_ORDER if stage_map[name].status == "confirmed"]
+    point = recovery_point(stage_map)
+    if point is None:
+        # Repeated resume on a fully confirmed job is a no-op: it must not fork
+        # a second job for the same snapshot or re-run confirmed stages.
+        return {
+            "job_id": job.id,
+            "recovery_point": None,
+            "skipped_confirmed": confirmed,
+            "retry_stages": [],
+            "enqueued": False,
+            "deduplicated": True,
+        }
     pipeline = build_pipeline(job.id)
     pipeline.apply_async()
-    return {"job_id": job.id, "current_stage": job.current_stage, "confirmed": [n for n, s in stages.items() if s.status == "confirmed"]}
+    return {
+        "job_id": job.id,
+        "recovery_point": point,
+        "skipped_confirmed": confirmed,
+        "retry_stages": retry_stages(stage_map),
+        "enqueued": True,
+        "deduplicated": False,
+    }
 
 
 @router.get("/projects/{project_id}/topology")
@@ -195,6 +217,24 @@ def topology(project_id: int, db: Session = Depends(get_db)):
 @router.get("/jobs/{job_id}")
 def job_detail(job_id: int, db: Session = Depends(get_db)):
     job = _get(db, Job, job_id)
+    stages = sorted(job.stages, key=lambda s: s.id)
+    stage_map = {s.name: s for s in stages}
+    attempts = db.scalars(
+        select(JobStageAttempt).where(JobStageAttempt.job_id == job_id).order_by(JobStageAttempt.id)
+    ).all()
+    attempts_by_stage: dict[str, list[JobStageAttempt]] = {}
+    for attempt in attempts:
+        attempts_by_stage.setdefault(attempt.stage_name, []).append(attempt)
+    # A job only counts as published when a real, non-superseded publication
+    # exists; a failed job must never be presented as a published result.
+    published = (
+        db.scalar(
+            select(func.count(Publication.id)).where(
+                Publication.job_id == job_id, Publication.superseded.is_(False)
+            )
+        )
+        > 0
+    )
     return {
         "id": job.id,
         "status": job.status,
@@ -204,11 +244,25 @@ def job_detail(job_id: int, db: Session = Depends(get_db)):
         "input_summary": job.snapshot.input_summary,
         "algorithm": job.snapshot.algorithm,
         "diagnostics": job.diagnostics,
-        "stages": [
-            {"name": s.name, "status": s.status, "attempt": s.attempt, "detail": s.detail}
-            for s in sorted(db.scalars(select(JobStage).where(JobStage.job_id == job_id)).all(), key=lambda s: s.id)
-        ],
+        "error_code": job.error_code,
+        "error_message": job.error_message,
+        "attempt": job.attempt,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "recovery_point": recovery_point(stage_map),
+        "published": published,
+        "stages": [serialize_stage(s, attempts_by_stage.get(s.name, [])) for s in stages],
     }
+
+
+@router.get("/jobs/{job_id}/stage-attempts")
+def job_stage_attempts(job_id: int, db: Session = Depends(get_db)):
+    """Full append-only attempt history for audit; retries never overwrite it."""
+    _get(db, Job, job_id)
+    attempts = db.scalars(
+        select(JobStageAttempt).where(JobStageAttempt.job_id == job_id).order_by(JobStageAttempt.id)
+    ).all()
+    return [serialize_attempt(a) for a in attempts]
 
 
 @router.get("/jobs/{job_id}/residuals")

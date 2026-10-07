@@ -12,6 +12,7 @@ from app.models.schema import (
     AuditEvent,
     Datum,
     Job,
+    JobStage,
     Observation,
     Point,
     Project,

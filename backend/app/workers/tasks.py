@@ -10,12 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.db import SessionLocal
-from app.models.schema import Job, JobStage, JobStatus, Snapshot, StageStatus
+from app.models.schema import Job, JobStage, JobStageAttempt, JobStatus, Snapshot, StageAttemptStatus, StageStatus
 from app.services import network
 from app.services.solver import execute_solve
 from app.workers.celery_app import celery_app
-
-STAGES = ("import_qc", "component_precheck", "solve", "publish_checks")
 
 
 def _now() -> datetime:
@@ -30,7 +28,16 @@ def _load_job(db: Session, job_id: int) -> tuple[Job, dict[str, JobStage]]:
     return job, stages
 
 
-def _mark_stage(stage: JobStage, status: str, detail: dict[str, Any] | None = None) -> None:
+def _mark_stage(
+    db: Session,
+    job: Job,
+    stage: JobStage,
+    status: str,
+    detail: dict[str, Any] | None = None,
+    *,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> None:
     if status == StageStatus.RUNNING and stage.status != StageStatus.RUNNING:
         stage.attempt += 1
         stage.started_at = _now()
@@ -42,6 +49,37 @@ def _mark_stage(stage: JobStage, status: str, detail: dict[str, Any] | None = No
     if detail is not None:
         stage.detail = detail
     stage.status = status
+    if status in (StageStatus.CONFIRMED, StageStatus.FAILED):
+        # Append-only audit: a retry creates a new attempt row instead of
+        # overwriting the previous failure, so old attempts stay visible.
+        db.add(
+            JobStageAttempt(
+                job_id=job.id,
+                stage_name=stage.name,
+                attempt=stage.attempt,
+                status=str(status),
+                detail=stage.detail or {},
+                error_code=error_code,
+                error_message=error_message,
+                started_at=stage.started_at,
+                completed_at=stage.completed_at,
+            )
+        )
+
+
+def _record_interrupted_attempt(db: Session, job: Job, stage: JobStage, reason: str) -> None:
+    """Preserve an orphaned RUNNING attempt before resetting it to pending."""
+    db.add(
+        JobStageAttempt(
+            job_id=job.id,
+            stage_name=stage.name,
+            attempt=stage.attempt,
+            status=StageAttemptStatus.INTERRUPTED,
+            detail={"reason": reason},
+            started_at=stage.started_at,
+            completed_at=_now(),
+        )
+    )
 
 
 @celery_app.task(name="pipeline.import_qc", bind=True, max_retries=2, default_retry_delay=5)
@@ -54,7 +92,7 @@ def import_qc(self, job_id: int) -> int:
         job.status = JobStatus.RUNNING
         job.current_stage = "import_qc"
         job.attempt += 1
-        _mark_stage(stages["import_qc"], StageStatus.RUNNING)
+        _mark_stage(db, job, stages["import_qc"], StageStatus.RUNNING)
         db.commit()
         try:
             rows = job.snapshot.payload["observations"]
@@ -65,9 +103,12 @@ def import_qc(self, job_id: int) -> int:
                 qc = list(executor.map(lambda args: qc_partition.run(*args), ((chunk, point_ids, index) for index, chunk in enumerate(chunks))))
             failed = [p for p in qc if not p["ok"]]
             _mark_stage(
+                db,
+                job,
                 stages["import_qc"],
                 StageStatus.CONFIRMED if not failed else StageStatus.FAILED,
                 {"partitions": qc, "failed_count": len(failed)},
+                error_code="import_qc_failed" if failed else None,
             )
             if failed:
                 job.status = JobStatus.FAILED
@@ -79,7 +120,15 @@ def import_qc(self, job_id: int) -> int:
             db.rollback()
             try:
                 job, stages = _load_job(db, job_id)
-                _mark_stage(stages["import_qc"], StageStatus.FAILED, {"error": str(exc)})
+                _mark_stage(
+                    db,
+                    job,
+                    stages["import_qc"],
+                    StageStatus.FAILED,
+                    {"error": str(exc)},
+                    error_code="import_qc_interrupted",
+                    error_message=str(exc),
+                )
                 job.status = JobStatus.AWAITING_RECOVERY
                 job.error_code = "import_qc_interrupted"
                 job.error_message = str(exc)
@@ -103,7 +152,7 @@ def component_precheck(job_id: int) -> int:
             raise RuntimeError("previous stage import_qc was not confirmed")
         job.status = JobStatus.RUNNING
         job.current_stage = "component_precheck"
-        _mark_stage(stages["component_precheck"], StageStatus.RUNNING)
+        _mark_stage(db, job, stages["component_precheck"], StageStatus.RUNNING)
         db.commit()
 
         payload = job.snapshot.payload
@@ -139,7 +188,7 @@ def component_precheck(job_id: int) -> int:
         }
         # A no-datum component is reported the same day, but the solve stage still
         # runs its QR diagnosis and refuses a fabricated vertical datum.
-        _mark_stage(stages["component_precheck"], StageStatus.CONFIRMED, detail)
+        _mark_stage(db, job, stages["component_precheck"], StageStatus.CONFIRMED, detail)
         if bad:
             job.diagnostics = {"component_warnings": bad}
         db.commit()
@@ -159,13 +208,15 @@ def solve(job_id: int) -> int:
             raise RuntimeError("component_precheck was not confirmed")
         job.status = JobStatus.RUNNING
         job.current_stage = "solve"
-        _mark_stage(stages["solve"], StageStatus.RUNNING)
+        _mark_stage(db, job, stages["solve"], StageStatus.RUNNING)
         db.commit()
         try:
             output = execute_solve(db, job)
             blocked = output["diagnostics"]["blocked_components"]
             closure_failed = output["diagnostics"]["pre_adjustment_closures"]["failed"]
             _mark_stage(
+                db,
+                job,
                 stages["solve"],
                 StageStatus.CONFIRMED if not blocked else StageStatus.FAILED,
                 {
@@ -174,6 +225,8 @@ def solve(job_id: int) -> int:
                     "pre_closure_failed_count": len(closure_failed),
                     "residual_statistics": output["diagnostics"]["residual_statistics"],
                 },
+                error_code="non_unique_or_illconditioned_solution" if blocked else None,
+                error_message="QR diagnostic blocked publication; no regularization applied" if blocked else None,
             )
             job.diagnostics = output["diagnostics"]
             job.status = JobStatus.FAILED if blocked else JobStatus.RUNNING
@@ -184,7 +237,15 @@ def solve(job_id: int) -> int:
         except Exception as exc:
             db.rollback()
             job, stages = _load_job(db, job_id)
-            _mark_stage(stages["solve"], StageStatus.FAILED, {"error": str(exc)})
+            _mark_stage(
+                db,
+                job,
+                stages["solve"],
+                StageStatus.FAILED,
+                {"error": str(exc)},
+                error_code="solve_interrupted",
+                error_message=str(exc),
+            )
             job.status = JobStatus.AWAITING_RECOVERY
             job.error_code = "solve_interrupted"
             job.error_message = str(exc)
@@ -204,11 +265,13 @@ def publish_checks(job_id: int) -> int:
             return job_id
         if stages["solve"].status != StageStatus.CONFIRMED:
             job.status = JobStatus.FAILED
+            job.error_code = "pipeline_incomplete"
+            job.error_message = "solve stage was not confirmed; publish checks cannot run"
             job.finished_at = _now()
             db.commit()
             return job_id
         job.current_stage = "publish_checks"
-        _mark_stage(stages["publish_checks"], StageStatus.RUNNING)
+        _mark_stage(db, job, stages["publish_checks"], StageStatus.RUNNING)
         db.commit()
 
         diagnostics = job.diagnostics or {}
@@ -244,13 +307,27 @@ def publish_checks(job_id: int) -> int:
         }
         passed = all(value.get("passed", False) for value in checks.values())
         if stale_draft:
-            _mark_stage(stages["publish_checks"], StageStatus.CONFIRMED, checks)
+            _mark_stage(db, job, stages["publish_checks"], StageStatus.CONFIRMED, checks)
             job.status = JobStatus.AUDITED_ONLY
             job.error_code = "stale_snapshot_audit_only"
             job.error_message = "running task completed against an immutable old snapshot; it cannot overwrite the newer draft"
         else:
-            _mark_stage(stages["publish_checks"], StageStatus.CONFIRMED if passed else StageStatus.FAILED, checks)
+            failed_checks = sorted(name for name, value in checks.items() if not value.get("passed", False))
+            _mark_stage(
+                db,
+                job,
+                stages["publish_checks"],
+                StageStatus.CONFIRMED if passed else StageStatus.FAILED,
+                checks,
+                error_code=None if passed else "publish_checks_failed",
+                error_message=None if passed else f"publish checks failed: {', '.join(failed_checks)}",
+            )
             job.status = JobStatus.COMPLETED if passed else JobStatus.FAILED
+            if not passed:
+                # Blocking diagnostics must survive restarts so a failed job is
+                # never repainted as a publishable result.
+                job.error_code = "publish_checks_failed"
+                job.error_message = f"publish checks failed: {', '.join(failed_checks)}"
         job.finished_at = _now()
         db.commit()
         return job_id
@@ -277,10 +354,12 @@ def run_pipeline(self, job_id: int) -> int:
     db = SessionLocal()
     try:
         job, stages = _load_job(db, job_id)
-        # If the old worker died, any RUNNING stage has no owner. Reset it to pending
-        # while CONFIRMED stages remain valid recovery points.
+        # If the old worker died, any RUNNING stage has no owner. Preserve the
+        # orphaned attempt for audit, then reset it to pending while CONFIRMED
+        # stages remain valid recovery points.
         for stage in stages.values():
             if stage.status == StageStatus.RUNNING:
+                _record_interrupted_attempt(db, job, stage, "worker lost; stage reset to pending")
                 stage.status = StageStatus.PENDING
         if str(job.status) == JobStatus.RUNNING:
             job.status = JobStatus.AWAITING_RECOVERY
